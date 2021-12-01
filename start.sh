@@ -1,56 +1,36 @@
 #!/bin/bash 
 
-#!/bin/bash 
-
 set -e
 
-GTID_MODE=${GTID_MODE:-off}
-SERVER_ID=${SERVER_ID:-0}
+useradd mysql || true
+mkdir -p /home/mysql && chown mysql:mysql /home/mysql
 
-mkdir -p -m 777 /var/lib/mysql
-chown -R mysql:mysql /var/lib/mysql
+mysqld --initialize-insecure --user=mysql
+mysql_ssl_rsa_setup --uid=mysql
+echo -e '[mysqld]\nserver-id=1\nlog-bin=mysql\nbinlog-format=row\ngtid-mode=ON\nenforce_gtid_consistency=ON\n' > /etc/mysql/conf.d/replication.cnf
 
-#
-# the default password for the debian-sys-maint user is randomly generated
-# during the installation of the mysql-server package.
-#
-# Due to the nature of docker we blank out the password such that the maintenance
-# user can login without a password.
-#
-sed 's/password = .*/password = /g' -i /etc/mysql/debian.cnf
+# start mysql server
+echo "Starting MySQL server..."
+service mysql start
 
-# initialize MySQL data directory
-if [ ! -d /var/lib/mysql/mysql ]; then
-  echo "Installing database..."
-  mysql_install_db --user=mysql  
+# wait for mysql server to start (max 30 seconds)
+timeout=30
+while ! /usr/bin/mysqladmin -u root status >/dev/null 2>&1
+do
+  timeout=$(($timeout - 1))
+  if [ $timeout -eq 0 ]; then
+    echo "Could not connect to mysql server. Aborting..."
+    exit 1
+  fi
+  echo "Waiting for database server to accept connections..."
+  sleep 1
+done
 
-  # start mysql server
-  echo "Starting MySQL server..."
-  /usr/bin/mysqld_safe &
+mysql -uroot -e "use mysql; update user set authentication_string=PASSWORD(''), host='%' where User='root'; update user set plugin='mysql_native_password'; FLUSH PRIVILEGES;"
 
-  # wait for mysql server to start (max 30 seconds)
-  timeout=30
-  while ! /usr/bin/mysqladmin -u root status >/dev/null 2>&1
-  do
-    timeout=$(($timeout - 1))
-    if [ $timeout -eq 0 ]; then
-      echo "Could not connect to mysql server. Aborting..."
-      exit 1
-    fi
-    echo "Waiting for database server to accept connections..."
-    sleep 1
-  done
+mysql -e "CREATE DATABASE IF NOT EXISTS test;" -uroot
+mysql -e "SHOW VARIABLES LIKE 'log_bin'" -uroot
 
-  ## create a localhost only, debian-sys-maint user
-  ## the debian-sys-maint is used while creating users and database
-  ## as well as to shut down or starting up the mysql server via mysqladmin
-  echo "Creating debian-sys-maint user..."
-  mysql -uroot -e "GRANT ALL PRIVILEGES on *.* TO 'debian-sys-maint'@'localhost' IDENTIFIED BY '' WITH GRANT OPTION;"
-
-  echo "Grant ALL to root"
-  mysql -uroot -e "GRANT ALL ON *.* TO 'root'@'%' IDENTIFIED BY '' WITH GRANT OPTION;"
-
-  /usr/bin/mysqladmin --defaults-file=/etc/mysql/debian.cnf shutdown
-fi
-
-/usr/bin/mysqld_safe --gtid_mode=${GTID_MODE} --server-id=${SERVER_ID} 
+# restart
+/usr/bin/mysqladmin shutdown
+/usr/bin/mysqld_safe
